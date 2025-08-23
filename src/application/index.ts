@@ -1,1 +1,2 @@
-export * from "./RoutePlannerService"; 
+export * from "./RoutePlannerService";
+export * from "./JourneyPlannerService";
