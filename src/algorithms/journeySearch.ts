@@ -71,16 +71,38 @@ class MinHeap<T> {
 function assignSeats(
   availableSeatIds: Set<string>,
   passengers: number,
+  preferredSeatIds?: (string | null)[],
 ): SeatAssignment[] | null {
   if (availableSeatIds.size < passengers) return null;
-  const chosen: string[] = [];
+  const used = new Set<string>();
+  const chosen: (string | null)[] = new Array(passengers).fill(null);
+
+  // First, try to honor preferred seats (for continuity on same train)
+  if (preferredSeatIds && preferredSeatIds.length === passengers) {
+    for (let i = 0; i < passengers; i++) {
+      const pref = preferredSeatIds[i];
+      if (pref && availableSeatIds.has(pref) && !used.has(pref)) {
+        chosen[i] = pref;
+        used.add(pref);
+      }
+    }
+  }
+
+  // Assign remaining passengers any available seats
   const iter = availableSeatIds.values();
   for (let i = 0; i < passengers; i++) {
-    const next = iter.next();
-    if (next.done) return null;
-    chosen.push(next.value);
+    if (chosen[i] !== null) continue;
+    let next: IteratorResult<string>;
+    // Find next seat that isn't already used
+    do {
+      next = iter.next();
+      if (next.done) return null;
+    } while (used.has(next.value));
+    chosen[i] = next.value;
+    used.add(next.value);
   }
-  return chosen.map((seatId, idx) => ({ passengerIndex: idx, seatId }));
+
+  return chosen.map((seatId, idx) => ({ passengerIndex: idx, seatId: seatId! }));
 }
 
 export async function findJourneys(
@@ -148,16 +170,110 @@ export async function findJourneys(
     );
     for (const seg of nextSegments) {
       if (state.usedSegmentIds.has(seg.id)) continue; // avoid cycles through identical segments
-      const availMap = await inventory.getAvailabilityForSegments([seg.id]);
-      const avail = availMap.get(seg.id);
-      if (!avail) continue;
+
+      const isSameTrain = seg.trainId === state.lastTrainId;
+      const prevSeg = state.segments[state.segments.length - 1];
+
+      // Fetch availability for current (and previous if same train) in one call
+      const idsToFetch = isSameTrain ? [prevSeg.id, seg.id] as SegmentId[] : [seg.id];
+      const availMap = await inventory.getAvailabilityForSegments(idsToFetch);
+      const availCurrent = availMap.get(seg.id);
+      if (!availCurrent) continue;
+
+      if (isSameTrain) {
+        const availPrev = availMap.get(prevSeg.id);
+        if (!availPrev) continue;
+
+        // Try strongest continuity: seats that are available on both previous and current segments
+        const intersection: string[] = [];
+        for (const id of availPrev.availableSeatIds) {
+          if (availCurrent.availableSeatIds.has(id)) intersection.push(id);
+        }
+
+        if (intersection.length >= options.passengers) {
+          // Reassign both previous and current segments to the same seats for full continuity
+          const seatsToUse = intersection.slice(0, options.passengers);
+          const prevSeatAssignments: SeatAssignment[] = seatsToUse.map((seatId, idx) => ({
+            passengerIndex: idx,
+            seatId,
+          }));
+          const currSeatAssignments: SeatAssignment[] = seatsToUse.map((seatId, idx) => ({
+            passengerIndex: idx,
+            seatId,
+          }));
+
+          const newSegments = [...state.segments, seg];
+          const newAssignments: JourneySegmentAssignment[] = [
+            ...state.assignments.slice(0, -1),
+            { segment: prevSeg, seatAssignments: prevSeatAssignments },
+            { segment: seg, seatAssignments: currSeatAssignments },
+          ];
+          const usedIds = new Set(state.usedSegmentIds);
+          usedIds.add(seg.id);
+          const nextState: State = {
+            currentStation: seg.toStationId,
+            currentTimeMs: seg.arrivalEpochMs,
+            segments: newSegments,
+            assignments: newAssignments,
+            usedSegmentIds: usedIds,
+            lastTrainId: seg.trainId,
+            changes: state.changes, // no change on same train
+            initialDepartureMs: state.initialDepartureMs,
+          };
+          const key =
+            seg.arrivalEpochMs -
+            nextState.initialDepartureMs +
+            nextState.changes * 10 * 60_000;
+          frontier.push(key, nextState);
+          continue;
+        }
+
+        // Partial continuity: keep seats that remain available; reassign only where necessary
+        const lastAssign = state.assignments[state.assignments.length - 1];
+        const preferred: (string | null)[] = new Array(options.passengers).fill(null);
+        for (const a of lastAssign.seatAssignments) {
+          preferred[a.passengerIndex] = a.seatId;
+        }
+        const currSeatAssignments = assignSeats(
+          availCurrent.availableSeatIds,
+          options.passengers,
+          preferred,
+        );
+        if (!currSeatAssignments) continue;
+
+        const changes = state.changes; // still same train
+        const newSegments = [...state.segments, seg];
+        const newAssignments: JourneySegmentAssignment[] = [
+          ...state.assignments,
+          { segment: seg, seatAssignments: currSeatAssignments },
+        ];
+        const usedIds = new Set(state.usedSegmentIds);
+        usedIds.add(seg.id);
+        const nextState: State = {
+          currentStation: seg.toStationId,
+          currentTimeMs: seg.arrivalEpochMs,
+          segments: newSegments,
+          assignments: newAssignments,
+          usedSegmentIds: usedIds,
+          lastTrainId: seg.trainId,
+          changes,
+          initialDepartureMs: state.initialDepartureMs,
+        };
+        const key =
+          seg.arrivalEpochMs -
+          nextState.initialDepartureMs +
+          changes * 10 * 60_000;
+        frontier.push(key, nextState);
+        continue;
+      }
+
+      // Different train: simple assignment for this segment
       const seatAssignments = assignSeats(
-        avail.availableSeatIds,
+        availCurrent.availableSeatIds,
         options.passengers,
       );
       if (!seatAssignments) continue;
-      const changes =
-        state.changes + (seg.trainId === state.lastTrainId ? 0 : 1);
+      const changes = state.changes + 1;
       const newSegments = [...state.segments, seg];
       const newAssignments: JourneySegmentAssignment[] = [
         ...state.assignments,
